@@ -1,0 +1,485 @@
+---
+title: "Spatial localization of cell types and functional tissue units across conditions.Implementation in 10X Visium and Xenium kidney samples"
+
+output: html_document
+date: "2024-12-02"
+---
+
+
+### Load required libraries
+```{r}
+library(SeuratObject,verbose = F)
+library(Seurat,verbose = F)
+library(dplyr,verbose = F)
+library(ggplot2)
+library(ggrepel)
+library(EnhancedVolcano)
+library(Matrix)
+```
+
+### ########################################################
+#   Part 1:Cell type localization
+### ########################################################
+
+##  1.1: Label transfer in Xenium
+
+```{r}
+reference.obj <- readRDS('tiny_atlas_min_25.RDS')
+DefaultAssay(reference.obj) <- 'SCT'
+
+xenium.obj <-  LoadXenium('xenium.obj/output-XETG00126__0010200__f59__20240214__210015/')
+
+#remove 0 counts to do SCTransform
+xenium.obj1 <- subset(xenium.obj, cells = colnames(xenium.obj)
+                      [colSums(GetAssayData(xenium.obj, assay = "Xenium",
+                                                    slot = "counts"))!= 0])
+
+xenium.obj1 <- SCTransform(xenium.obj1, assay = "Xenium", verbose = FALSE) %>% RunPCA(verbose = FALSE)
+
+anchors <- FindTransferAnchors(reference = reference.obj, query = xenium.obj1, normalization.method = "SCT",verbose = F)
+
+# Transfer annotations from a reference dataset to the query dataset (xenium.obj1)
+predictions.assay <- TransferData(anchorset = anchors, refdata =reference.obj$subclass.l2, prediction.assay = TRUE,weight.reduction = xenium.obj1[["pca"]], dims = 1:50,verbose = F)
+
+xenium.obj1[["predictions.assay"]] <- predictions.assay
+
+predictions <- TransferData(anchorset = anchors, refdata =reference.obj$subclass.l2,weight.reduction = xenium.obj1[["pca"]], dims = 1:50,verbose = F)
+#adding cell annotations to meta.data
+xenium.obj1@meta.data$anchors_predictions <- predictions[rownames(xenium.obj1@meta.data),"predicted.id"]
+
+#save obj
+#saveRDS(xenium.obj1,'xenium.sample1.RDS')
+
+#plot
+ImageDimPlot(xenium.obj1, group.by = 'anchors_predictions', axes = TRUE)
+ImageFeaturePlot(xenium.obj1,  features = c("NPHS2",'LRP2'), size = 1, axes = TRUE,max.cutoff = "q90")
+
+
+```
+
+
+##  1.2: Spot deconvolution in Visium
+
+```{r }
+
+#install to faster SCTransform
+#BiocManager::install('glmGamPoi')
+
+#Loading the reference data set
+reference.obj=readRDS('tiny_atlas_min_25.RDS')
+spatial.obj <- Load10X_Spatial('V10S15-101_XY03_IU_21-019/outs/')
+
+#Normalizing the spatial
+spatial.obj <- SCTransform(spatial.obj, assay = "Spatial", verbose = FALSE) %>%  RunPCA(verbose = FALSE)
+
+
+DefaultAssay(reference.obj) <- 'SCT'
+
+# Find transfer anchors between the reference and the query (spatial.obj) datasets
+anchors.st <- FindTransferAnchors(reference = reference.obj, query = spatial.obj,normalization.method = "SCT",query.assay='SCT',
+                               recompute.residuals = FALSE,verbose = F)
+
+
+# Transfer annotations from the reference dataset to the query dataset
+predictions.assay <- TransferData(anchorset = anchors.st, refdata = reference.obj@meta.data[["subclass.l2"]], prediction.assay = TRUE, 
+                                  weight.reduction = spatial.obj[["pca"]],
+                                  dims = 1:30,verbose = F)
+
+
+# Add the predictions assay to the spatial dataset
+spatial.obj[["predictions"]] <- predictions.assay
+
+spatial.obj@assays[["predictions"]]@data[1:6,1:3]
+
+# Set the default assay 
+DefaultAssay(spatial.obj) <- "predictions"
+
+#plot
+SpatialFeaturePlot(spatial.obj, features = c("PT-S1", "C-TAL"), 
+                   pt.size.factor = 1.6, ncol = 2, crop = F)
+
+
+
+```
+
+### ########################################################
+#   Part 2: Sample integration
+### ########################################################
+
+##  2.1: Select Regions of interest (e.g. glomeruli) in Loupe browser
+
+##  2.2: Add selected ROIs to sample object & DEG in glom vs TI
+
+
+```{r }
+
+#load obj
+spatial <- readRDS('V10S14-087_XY01_21-0061.RDS')
+
+#load csv file, output of loupe browser
+glom <- read.csv('V10S14-087_XY01_21-0061.csv')
+head(glom)
+
+#assign barcodes as the the row names of csv 
+rownames(glom) <- glom$Barcode
+glom$Barcode <- NULL
+head(glom)
+
+#add ROI info to sample object
+spatial@meta.data$glom <- glom[rownames(spatial@meta.data),'Gloms']
+spatial@meta.data$orig.ident <- 'V10S14-087_XY01_21-0061'
+DefaultAssay(spatial) <- 'SCT'
+colnames(spatial@meta.data)
+unique(spatial$glom)
+
+
+#DET
+
+markers=FindMarkers(spatial,ident.1 = "glom",ident.2= "no_glom",group.by = 'glom')
+head(markers)
+markers=markers[markers$p_val_adj<0.05,]#Select significant genes
+
+```
+
+```{r volcano-plot-1, fig.width=9, fig.height=8}
+#plot DEGs
+p1 <- EnhancedVolcano(markers,lab =rownames(markers) ,selectLab = rownames(markers),pCutoff = 0.05,
+                x = 'avg_log2FC',y = 'p_val_adj',FCcutoff = 0.25,
+                title = 'DEGs in gloms')
+p1
+
+```
+
+##  2.3: Sample integration and normalization
+
+```{r}
+#load list of samples with conditions
+sample_list=read.csv('Sample_List.csv')
+View(sample_list)
+
+sample_all <- list()
+
+for (sample in sample_list$Specimen){
+  #selecting only the rows where the Sample column matches current_sample
+  aux <- sample_list[sample_list$Specimen==sample,]
+  #read obj
+  spatial <- readRDS(paste0('',sample,'.RDS'))
+  #add sample ID of the current sample
+  spatial@meta.data$orig.ident <- aux$Specimen 
+  spatial@meta.data$condition <- aux$Condition #add condition of the current sample
+  DefaultAssay(spatial) <- 'SCT'
+  sample_all[[sample]] <- spatial #save obj in the list
+}
+
+
+#merging objects of the list
+merged.obj<- merge(sample_all[[1]],sample_all[2:3])
+
+DefaultAssay(merged.obj) <- 'Spatial'
+merged.obj <- NormalizeData(merged.obj,verbose = F)
+merged.obj <- FindVariableFeatures(merged.obj,verbose = F)
+merged.obj <- ScaleData(merged.obj,verbose = F)
+merged.obj <- RunPCA(merged.obj,verbose=F)
+
+
+#Perform integrative analysis
+merged.obj <- IntegrateLayers(object = merged.obj, assay='Spatial',
+                              method = CCAIntegration, 
+                              orig.reduction = "pca",
+                              new.reduction = "integrated.cca",
+                              k.weight = 80,verbose = F)
+
+merged.obj <- FindNeighbors(merged.obj, reduction = "integrated.cca", dims = 1:30,verbose = F)
+merged.obj <- FindClusters(merged.obj, resolution = 2, cluster.name = "cca_clusters",verbose=F)
+merged.obj <- RunUMAP(merged.obj, reduction = "integrated.cca", dims = 1:30, reduction.name = "umap.cca",verbose=F)
+
+
+#get SCT assay
+merged.obj <- SCTransform(merged.obj,assay = 'Spatial',verbose = F)
+
+# Extract the SCT results stored in the "umi.assay"
+SCTResults(object=merged.obj, slot="umi.assay")
+scttemp <- SCTResults(merged.obj, slot="umi.assay")
+
+# Update the "umi.assay" slot of each SCT model to indicate the assay name as "Spatial"
+for(i in 1:length(scttemp)) {
+   slot(object = merged.obj@assays$SCT@SCTModel.list[[i]], name="umi.assay")<-"Spatial"
+}
+
+SCTResults(object=merged.obj, slot="umi.assay")
+# Prepare the SCT assay for marker detection by ensuring that all SCT models are processed
+merged.obj=PrepSCTFindMarkers(merged.obj,assay = 'SCT')
+
+#make obj ready for neighborhood
+#removing max column from prediction assay
+DefaultAssay(merged.obj) <- "predictions"
+rownames(merged.obj@assays$predictions)
+
+SCT.assay=merged.obj[['SCT']]
+Spatial.assay=merged.obj[['Spatial']]
+
+#remove SCT and Spatial assay to subset prediction assay
+merged.obj[['SCT']] <- NULL
+merged.obj[['Spatial']] <- NULL
+
+#subset to remove max column
+merged.obj1 <- subset(merged.obj,features = rownames(merged.obj@assays$predictions)[1:74]) 
+
+rownames(merged.obj1@assays$predictions)
+
+#adding SCT and Spatial assays to the object
+merged.obj1[['SCT']]=SCT.assay
+merged.obj1[['Spatial']] <- Spatial.assay
+Assays(merged.obj1)
+
+
+DimPlot(merged.obj1, reduction = "umap.cca",group.by = c("orig.ident"))
+DimPlot(merged.obj1, reduction = "umap.cca",group.by = c("glom"))
+
+
+
+```
+
+##  2.4: DEG of Glom in ref vs glom in DKD
+
+```{r}
+integ.obj=readRDS('merged_all_1.RDS')
+unique(integ.obj@meta.data$glom_condition)
+
+markers_DKD= FindMarkers(integ.obj,ident.1 = "glom_DKD",ident.2="glom_Ref" ,group.by = 'glom_condition',assay = 'SCT')
+
+markers_DKD=markers_DKD[markers_DKD$p_val_adj<0.05,]
+head(markers_DKD)
+
+
+```
+
+```{r volcano-plot, fig.width=8, fig.height=8}
+# Create the volcano plot
+p <- EnhancedVolcano(
+  markers_DKD,
+  lab = rownames(markers_DKD),          # Labels for points
+  selectLab = rownames(markers_DKD),   # Labels to highlight
+  pCutoff = 0.05,                      # P-value cutoff
+  x = 'avg_log2FC',                    # X-axis variable
+  y = 'p_val_adj',                     # Y-axis variable
+  FCcutoff = 0.25,                     # Fold change cutoff
+  title = 'DEGs in DKD gloms'          # Plot title
+)
+p
+
+```
+
+### ########################################################
+#   Part3: Niches
+### ########################################################
+
+##  3.1: Defining neighborhoods
+
+```{r}
+#load obj
+integ.obj=readRDS('merged_all_1.RDS')
+
+#set default assay
+DefaultAssay(integ.obj) <- "predictions"
+VariableFeatures(integ.obj) <- rownames(integ.obj@assays$predictions)
+integ.obj  <- ScaleData(integ.obj)
+integ.obj <- RunPCA(integ.obj, verbose = FALSE)
+
+#make elbow plot to find the proper dimension
+ElbowPlot(integ.obj)
+
+integ.obj <- FindNeighbors(integ.obj, dims = 1:15)
+integ.obj <- FindClusters(integ.obj, verbose = FALSE,resolution = 0.5)
+
+#plot
+integ.obj <- RunUMAP(integ.obj, dims = 1:15,reduction.name = 'umap_l2',verbose = F)
+
+DimPlot(integ.obj,group.by = 'predictions_snn_res.0.5',pt.size = 1.0)
+DimPlot(integ.obj,group.by = 'orig.ident',label = TRUE,pt.size = 1.0)
+
+#define features to plot
+celltypes=c("PT-S1","PT-S2","C-TAL","M-TAL","MAC-M2","B" ,"T" ,"FIB","aFIB","POD","EC-GC","EC-AEA" ,"EC-AVR")
+DotPlot(integ.obj,features =celltypes,group.by = "predictions_snn_res.0.5"  )+
+  theme(axis.text.x = element_text(angle=90,vjust=0.5))+  ggtitle("Cell ditribution in neighborhood clusters")
+```
+
+##  3.2: Localization between Glom-TI (fisher’s test)
+
+```{r}
+# creates a table by condition and seurat cluster
+cluster_tab <- table(integ.obj@meta.data$glom,integ.obj@meta.data$seurat_clusters)
+cluster_tab 
+
+#table of all the summed TI/glom for all the clusters
+sum_tab <- data.frame(rowSums(cluster_tab)) 
+
+#make empty df to add data
+fisher_results <- data.frame(matrix(ncol=2, nrow = 16), row.names = 0:15) 
+colnames(fisher_results) <- c('p.value', 'odds.ratio') 
+
+#generate fisher's test input
+fish_tab <- data.frame(matrix(ncol = 2, nrow = 2), row.names = c('glom', 'TI')) 
+colnames(fish_tab) <- c('cluster', 'other') 
+
+
+#make empty df to add OR and CI
+forest <- as.data.frame(matrix(0,ncol=3,nrow = 16,
+                               dimnames = list(0:15,c('low','OR','high'))))
+
+
+###measure the glom spots and TI in each niche cluster###
+
+for(i in  1:16){
+  # assigning value to freq of gloms spot in the current Cluster
+  fish_tab$cluster[1] <- cluster_tab[1, i]
+  
+  #assigning value to freq of TI spot in the current cluster
+  fish_tab$cluster[2] <- cluster_tab[2, i]
+  
+   #assigning value  to freq of gloms spot in other Cluster
+  fish_tab$other[1] <- (sum_tab[1, 1]- cluster_tab[1, i])
+  
+  #assigning value to freq of TI spot in other cluster
+  fish_tab$other[2] <- (sum_tab[2,1] - cluster_tab[2, i])
+  
+  test <- fisher.test(fish_tab)
+  
+  fisher_results$p.value[i] <-test$p.value 
+  
+  fisher_results$odds.ratio[i] <-data.frame(test$estimate)[1,1] 
+  forest[i,'OR'] <- log2(test$estimate)
+  forest[i,'low'] <- log2(test$conf.int[1])
+  forest[i,'high'] <- log2(test$conf.int[2])
+}
+
+#add cluster number
+fisher_results$cluster <- factor(rownames(fisher_results),levels = rownames(fisher_results))
+
+fisher_results$condition <- ifelse(fisher_results$odds.ratio >1,'Glom','TI')
+fisher_results$log2odds <- log2(fisher_results$odds.ratio)
+
+#plot Odds ratio (Glom vs TI)
+ggplot(fisher_results,aes(x=cluster,y=log2odds,fill=condition))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = c('#FFA829','#8DCFFF'))+
+  theme_classic()
+```
+
+
+
+```{r}
+
+# Forest plot glom vs TI in niche cluster
+forest$cluster <- factor(rownames(forest),levels=rev(rownames(fisher_results)))
+ggplot(data=forest, aes(x=cluster, y=OR, ymin=low, ymax=high,color=cluster)) +
+  geom_pointrange(size = .7,linewidth = 1,shape = 2) +geom_hline(yintercept=0, lty=2) + 
+  scale_x_discrete(limits=rownames(fisher_results))+
+  xlab("Cluster") + ylab("Log2 OR (95% CI)")+
+  scale_color_manual(values = rev(c(rep('#8DCFFF',5),'#FFA829',
+                                rep('#8DCFFF',6),'#FFA829',
+                                rep('#8DCFFF',2),'#FFA829')),
+                     name = element_blank(),
+                     guide = guide_legend(reverse = TRUE))+
+  theme_classic()+
+  theme(panel.border = element_rect(color = "black", fill=NA,
+                                    linewidth = 1.5),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10))
+```
+
+
+
+
+
+##  3.2: Localization between Conditions (fisher’s test)
+```{r}
+
+# creates a table by condition and seurat cluster
+
+cluster_tab_1 <- table(integ.obj@meta.data$condition,integ.obj@meta.data$seurat_clusters)
+cluster_tab_1
+
+#table of all the conditions summed for all the clusters
+sum_tab_1 <- data.frame(rowSums(cluster_tab_1))
+
+fisher_results_1 <- data.frame(matrix(ncol=2, nrow = 16), row.names = 0:15) 
+
+colnames(fisher_results_1) <- c('p.value', 'odds.ratio') 
+
+fish_tab_1 <- data.frame(matrix(ncol = 2, nrow = 2), row.names = c('DKD', 'Ref')) 
+colnames(fish_tab_1) <- c('cluster', 'other') 
+
+cluster_tab_1
+
+
+forest_1 <- as.data.frame(matrix(0,ncol=3,nrow = 16,
+                               dimnames = list(0:15,c('low','OR','high'))))
+
+###measure the DKD and REF spots in each niche cluster###
+for(i in  1:16){
+  # assigning value to freq of DKD spot in the current Cluster 
+  fish_tab_1$cluster[1] <- cluster_tab_1[1, i]
+  
+  #assigning value to freq of REF spot in the current cluster
+  fish_tab_1$cluster[2] <- cluster_tab_1[2, i] 
+  
+  #assigning value  to freq of DKD spot in other Cluster
+  fish_tab_1$other[1] <- (sum_tab_1[1, 1]- cluster_tab_1[1, i])
+  
+   #assigning value to freq of REF spot in other cluster
+  fish_tab_1$other[2] <- (sum_tab_1[2,1] - cluster_tab_1[2, i])
+  
+  test_1 <- fisher.test(fish_tab_1)
+  
+  fisher_results_1$p.value[i] <-test_1$p.value 
+  
+  fisher_results_1$odds.ratio[i] <-data.frame(test_1$estimate)[1,1] 
+  forest_1[i,'OR'] <- log2(test_1$estimate)
+  forest_1[i,'low'] <- log2(test_1$conf.int[1])
+  forest_1[i,'high'] <- log2(test_1$conf.int[2])
+}
+
+
+fisher_results_1$cluster <- factor(rownames(fisher_results_1),levels = rownames(fisher_results_1))
+fisher_results_1$condition <- ifelse(fisher_results_1$odds.ratio >1,'DKD','Ref')
+fisher_results_1$log2odds <- log2(fisher_results_1$odds.ratio)
+
+#plot Odds ratio (DKD vs REF)
+ggplot(fisher_results_1,aes(x=cluster,y=log2odds,fill=condition))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = c('#FFA829','#8DCFFF'))+
+  theme_classic()
+
+```
+
+
+
+
+```{r}
+
+# Forest plot DKD vs REF niche cluster
+
+forest_1$cluster <- factor(rownames(forest_1),levels=rev(rownames(fisher_results_1)))
+
+
+ggplot(data=forest_1, aes(x=cluster, y=OR, ymin=low, ymax=high, color=cluster)) +
+  geom_pointrange(size = 0.7, linewidth = 1, shape = 2) + 
+  geom_hline(yintercept = 0, lty = 2) +  # Add a dotted line at x=0
+  scale_x_discrete(limits = rownames(fisher_results_1)) +
+  xlab("Cluster") + ylab("Log2 OR (95% CI)") +
+  scale_color_manual(
+    values = rev(c(rep('#8DCFFF', 2), '#FFA829',
+                   rep('#8DCFFF', 4), rep('#FFA829', 3),
+                   rep('#8DCFFF', 3), '#FFA829', rep('#8DCFFF', 2))),
+    name = element_blank())+
+  theme_classic()+
+  theme(panel.border = element_rect(color = "black", fill=NA, linewidth = 1.5),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10))
+
+```
+
+
+
+
