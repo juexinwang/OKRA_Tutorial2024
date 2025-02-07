@@ -12,7 +12,7 @@ Tested on Windows 11 12th Gen Intel(R) i7-1265U with R version 4.2.1.
 
 # Installation
 
-Installation instructions will be included in the following code sections. 
+Installation instructions will be included in the following code sections. The data can be found at https://indiana-my.sharepoint.com/:f:/r/personal/mraina_iu_edu/Documents/OKRA_data/data?csf=1&web=1&e=TwJwxR 
 
 # Data visualization on single cells
 
